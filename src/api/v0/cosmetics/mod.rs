@@ -3,6 +3,7 @@ mod get_player;
 pub(in crate::api) mod grant;
 mod list;
 mod manage;
+mod nameplate;
 mod put_player;
 mod search;
 mod view;
@@ -272,8 +273,11 @@ pub(super) type CosmeticRow = (
 	Vec<BodySlot>,
 );
 
-pub(super) fn is_redundant_variant(variant_name: Option<&str>) -> bool {
-	let Some(name) = variant_name else {
+pub(super) fn is_redundant_variant(cosmetic: &cosmetic::Model) -> bool {
+	if cosmetic.r#type == CosmeticType::Nameplate {
+		return false;
+	}
+	let Some(name) = cosmetic.variant_name.as_deref() else {
 		return false;
 	};
 
@@ -293,9 +297,7 @@ pub(super) async fn group_cosmetics(
 		BTreeMap::new();
 
 	for (cosmetic, asset, cover_asset, allowed_slots) in cosmetics {
-		if hide_redundant_variants
-			&& is_redundant_variant(cosmetic.variant_name.as_deref())
-		{
+		if hide_redundant_variants && is_redundant_variant(&cosmetic) {
 			continue;
 		}
 
