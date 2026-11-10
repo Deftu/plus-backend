@@ -10,6 +10,7 @@ pub(crate) const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 128;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MANIFEST: &str = "manifest.json";
+const DEFAULT_VARIANT: &str = "default";
 const FORMAT: u64 = 1;
 
 #[derive(thiserror::Error, Debug)]
@@ -48,7 +49,7 @@ struct Manifest {
 }
 
 pub(crate) struct NameplateBundle {
-	variants: Option<Vec<String>>,
+	variants: Vec<String>,
 }
 
 impl NameplateBundle {
@@ -103,9 +104,12 @@ impl NameplateBundle {
 		}
 
 		Ok(Self {
-			variants: manifest
-				.variants
-				.map(|variants| variants.into_iter().map(|(key, _)| key).collect()),
+			variants: match manifest.variants {
+				Some(variants) if !variants.is_empty() => {
+					variants.into_iter().map(|(key, _)| key).collect()
+				}
+				_ => vec![DEFAULT_VARIANT.to_string()],
+			},
 		})
 	}
 
@@ -113,10 +117,8 @@ impl NameplateBundle {
 		&self,
 		key: Option<&str>,
 	) -> Result<(), NameplateBundleError> {
-		match (key, &self.variants) {
-			(Some(key), Some(variants))
-				if !variants.iter().any(|variant| variant == key) =>
-			{
+		match key {
+			Some(key) if !self.variants.iter().any(|variant| variant == key) => {
 				Err(NameplateBundleError::UnknownVariant(key.to_string()))
 			}
 			_ => Ok(()),
