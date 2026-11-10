@@ -19,6 +19,8 @@ pub enum UpdateVariantError {
 	MissingCosmetic,
 	#[error("At least one body slot must be provided")]
 	MissingSlots,
+	#[error("Nameplates take exactly one body slot, `nameplate`")]
+	InvalidNameplateSlots,
 	#[error("Database error: {0}")]
 	Database(#[from] sea_orm::error::DbErr),
 	#[error(transparent)]
@@ -44,7 +46,9 @@ impl IntoResponse for UpdateVariantError {
 		crate::api::admin_error_response(
 			match self {
 				Self::MissingCosmetic => StatusCode::NOT_FOUND,
-				Self::MissingSlots | Self::Nameplate(_) => StatusCode::BAD_REQUEST,
+				Self::MissingSlots | Self::InvalidNameplateSlots | Self::Nameplate(_) => {
+					StatusCode::BAD_REQUEST
+				}
 				Self::Database(_) | Self::S3(_) => StatusCode::INTERNAL_SERVER_ERROR,
 			},
 			self,
@@ -138,6 +142,9 @@ async fn endpoint(
 	if let Some(slots) = &body.slots {
 		if slots.is_empty() && cosmetic.r#type != CosmeticType::Emote {
 			return Err(UpdateVariantError::MissingSlots);
+		}
+		if cosmetic.r#type == CosmeticType::Nameplate && slots != &[BodySlot::Nameplate] {
+			return Err(UpdateVariantError::InvalidNameplateSlots);
 		}
 
 		CosmeticAllowedSlot::delete_many()
