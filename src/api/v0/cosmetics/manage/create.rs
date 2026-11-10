@@ -31,7 +31,7 @@ use crate::{
 	utils::{
 		hash::sha256_hex,
 		money::to_cents,
-		zip::{is_zip, strip_macos_junk},
+		zip::{is_zip, strip_macos_junk, strip_macos_junk_capped},
 	},
 };
 
@@ -645,7 +645,12 @@ pub(super) async fn store_cosmetic_file(
 
 	let is_emote = matches!(cosmetic_type, CosmeticType::Emote);
 	let is_bundle = is_zip(data);
-	let data: Vec<u8> = if is_bundle {
+	let data: Vec<u8> = if is_bundle && matches!(cosmetic_type, CosmeticType::Nameplate) {
+		strip_macos_junk_capped(
+			data,
+			crate::api::v0::cosmetics::nameplate::MAX_UNPACKED_BYTES,
+		)?
+	} else if is_bundle {
 		strip_macos_junk(data)?
 	} else {
 		data.to_vec()

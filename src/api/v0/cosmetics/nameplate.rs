@@ -6,7 +6,7 @@ use zip::ZipArchive;
 use crate::{api::ApiState, utils::zip::is_zip};
 
 const MAX_BUNDLE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 128;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MANIFEST: &str = "manifest.json";
