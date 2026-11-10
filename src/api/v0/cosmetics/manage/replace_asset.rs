@@ -196,6 +196,8 @@ async fn endpoint(
 	active.cover_asset_id = Set(cover_asset_id);
 	let updated = active.update(&state.database).await?;
 
+	crate::api::v0::cosmetics::notify_catalog_updated(&state).await;
+
 	Ok(Json(ReplaceAssetResponse {
 		cosmetic_id: updated.id,
 		asset_id: asset.id,

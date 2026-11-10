@@ -87,6 +87,8 @@ pub(super) struct VariantInfo {
 	url: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	cover_url: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	variant_key: Option<String>,
 	#[serde(flatten)]
 	cached_info: CachedAssetInfo,
 }
@@ -137,9 +139,18 @@ impl VariantInfo {
 			model: value.model_variant.clone(),
 			url: CachedAssetInfo::asset_url(asset, public_url),
 			cover_url: CachedAssetInfo::asset_url(cover_asset, public_url),
+			variant_key: value.variant_key.clone(),
 			cached_info,
 		})
 	}
+}
+
+pub(super) async fn notify_catalog_updated(state: &ApiState) {
+	let version = chrono::Utc::now().timestamp_millis();
+	crate::api::v0::websocket::broadcast_all(state, || {
+		crate::api::v0::websocket::structs::ClientBoundPacket::CatalogUpdated { version }
+	})
+	.await;
 }
 
 /// Matches cosmetics that are not hidden by their group

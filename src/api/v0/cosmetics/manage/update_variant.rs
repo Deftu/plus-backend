@@ -54,6 +54,11 @@ struct UpdateVariantRequest {
 	model_variant: Option<Option<String>>,
 	/// When set, the variant's position within its group.
 	variant_order: Option<i32>,
+	#[serde(
+		default,
+		deserialize_with = "serde_with::rust::double_option::deserialize"
+	)]
+	variant_key: Option<Option<String>>,
 	/// When set, replaces the body slots this variant may be equipped in.
 	/// Players equipping it in a removed slot are unequipped.
 	slots: Option<Vec<BodySlot>>,
@@ -156,11 +161,16 @@ async fn endpoint(
 	if let Some(variant_order) = body.variant_order {
 		active.variant_order = Set(variant_order);
 	}
+	if let Some(variant_key) = body.variant_key {
+		active.variant_key = Set(variant_key);
+	}
 	if active.is_changed() {
 		active.update(&txn).await?;
 	}
 
 	txn.commit().await?;
+
+	crate::api::v0::cosmetics::notify_catalog_updated(&state).await;
 
 	Ok(StatusCode::NO_CONTENT)
 }
