@@ -96,6 +96,7 @@ fn parse_cosmetic_type(value: &str) -> Option<CosmeticType> {
 		"boots" => Some(CosmeticType::Boots),
 		"shoulder" => Some(CosmeticType::Shoulder),
 		"pet" => Some(CosmeticType::Pet),
+		"nameplate" => Some(CosmeticType::Nameplate),
 		"emote" => Some(CosmeticType::Emote),
 		_ => None,
 	}
@@ -114,6 +115,7 @@ fn parse_body_slot(value: &str) -> Option<BodySlot> {
 		"boots" => Some(BodySlot::Boots),
 		"shoulder" => Some(BodySlot::Shoulder),
 		"pet" => Some(BodySlot::Pet),
+		"nameplate" => Some(BodySlot::Nameplate),
 		_ => None,
 	}
 }
@@ -130,6 +132,7 @@ fn default_name(cosmetic_type: &CosmeticType) -> &'static str {
 		CosmeticType::Boots => "Boots",
 		CosmeticType::Shoulder => "Shoulder",
 		CosmeticType::Pet => "Pet",
+		CosmeticType::Nameplate => "Nameplate",
 		CosmeticType::Emote => "Emote",
 	}
 }
@@ -146,6 +149,7 @@ fn storage_prefix(cosmetic_type: &CosmeticType) -> &'static str {
 		CosmeticType::Boots => "boots",
 		CosmeticType::Shoulder => "shoulders",
 		CosmeticType::Pet => "pets",
+		CosmeticType::Nameplate => "nameplates",
 		CosmeticType::Emote => "emotes",
 	}
 }
@@ -225,6 +229,7 @@ struct CosmeticUploadRequest {
 	/// Optional time in seconds into the emote or cosmetic animation the cover
 	/// is captured at (default 1).
 	cover_seconds: Option<f32>,
+	variant_key: Option<String>,
 }
 
 impl OperationInput for FileUpload {
@@ -276,6 +281,7 @@ async fn endpoint(
 	let mut model_variant = None;
 	let mut variant_order = 0;
 	let mut cover_seconds = None;
+	let mut variant_key = None;
 
 	while let Some(field) = multipart.next_field().await? {
 		match field.name() {
@@ -345,6 +351,13 @@ async fn endpoint(
 				let trimmed = value.trim();
 				if !trimmed.is_empty() {
 					model_variant = Some(trimmed.to_string());
+				}
+			}
+			Some("variant_key") => {
+				let value = field.text().await?;
+				let trimmed = value.trim();
+				if !trimmed.is_empty() {
+					variant_key = Some(trimmed.to_string());
 				}
 			}
 			Some("variant_order") => {
@@ -454,6 +467,7 @@ async fn endpoint(
 		variant_name: Set(variant_name),
 		model_variant: Set(model_variant),
 		variant_order: Set(variant_order),
+		variant_key: Set(variant_key),
 		store_product_id: Set(store_product_id),
 		base_price: Set(price_value),
 		collection: Set(collection),
@@ -538,6 +552,8 @@ async fn endpoint(
 	)
 	.await?;
 
+	crate::api::v0::cosmetics::notify_catalog_updated(&state).await;
+
 	Ok(Json(infos.remove(0)))
 }
 
@@ -604,26 +620,30 @@ pub(super) async fn store_cosmetic_file(
 	.insert(&state.database)
 	.await?;
 
-	let renders = match crate::api::v0::cosmetics::cover::render_cosmetic(
-		&state.client,
-		cosmetic_type.clone(),
-		slots,
-		model_variant,
-		cover_seconds,
-		data,
-	)
-	.await
-	{
-		Ok(renders) => match store_renders(state, &renders).await {
-			Ok(ids) => Some(ids),
+	let renders = if matches!(cosmetic_type, CosmeticType::Nameplate) {
+		None
+	} else {
+		match crate::api::v0::cosmetics::cover::render_cosmetic(
+			&state.client,
+			cosmetic_type.clone(),
+			slots,
+			model_variant,
+			cover_seconds,
+			data,
+		)
+		.await
+		{
+			Ok(renders) => match store_renders(state, &renders).await {
+				Ok(ids) => Some(ids),
+				Err(error) => {
+					tracing::warn!("Unable to store cosmetic cover asset: {error}");
+					None
+				}
+			},
 			Err(error) => {
-				tracing::warn!("Unable to store cosmetic cover asset: {error}");
+				tracing::warn!("Unable to render cosmetic cover: {error}");
 				None
 			}
-		},
-		Err(error) => {
-			tracing::warn!("Unable to render cosmetic cover: {error}");
-			None
 		}
 	};
 
