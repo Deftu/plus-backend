@@ -21,11 +21,11 @@ use entities::{
 };
 use schemars::JsonSchema;
 use sea_orm::{
-	ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, Set,
-	TransactionTrait, prelude::Expr,
+	ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbErr, EntityTrait,
+	QueryFilter, Set, TransactionTrait, prelude::Expr,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
@@ -110,41 +110,7 @@ pub(in crate::api) async fn grant_cosmetics(
 	if !ids.is_empty() {
 		for &player_uuid in &players {
 			let player = User::get_or_create(&txn, player_uuid).await?;
-			let transaction = transaction::ActiveModel {
-				player_id: Set(player.id),
-				provider: Set(TransactionProvider::AdminGrant),
-				provider_transaction_id: Set(None),
-				status: Set(TransactionStatus::Completed),
-				raw_metadata: Set(json!({ "reason": "admin_grant" })),
-				..Default::default()
-			}
-			.insert(&txn)
-			.await?;
-
-			// Owned for good, including over a rental the player already holds.
-			ownership::record(
-				&txn,
-				player.id,
-				&ids,
-				TransactionProvider::AdminGrant,
-				Some(transaction.id),
-				None,
-				None,
-			)
-			.await?;
-			ownership::settle(&txn, player.id, &ids).await?;
-
-			record_ownership_events(
-				&txn,
-				player.id,
-				&ids,
-				OwnershipEventKind::Granted,
-				TransactionProvider::AdminGrant,
-				Some(transaction.id),
-				None,
-				None,
-			)
-			.await?;
+			record_grant(&txn, player.id, &ids, json!({ "reason": "admin_grant" })).await?;
 		}
 	}
 
@@ -242,6 +208,63 @@ pub(in crate::api) async fn revoke_cosmetics(
 	Ok(removed)
 }
 
+/// Grants a cosmetic, and the rest of its group, inside `txn`, returning
+/// `(cosmetic_ids, emote_ids)` to [`notify`] with once it commits.
+pub(in crate::api) async fn grant_in(
+	txn: &DatabaseTransaction,
+	player_id: i32,
+	cosmetic_id: i32,
+	metadata: Value,
+) -> Result<(Vec<i32>, Vec<i32>), GrantError> {
+	let cosmetics = expand_groups(txn, &[cosmetic_id]).await?;
+	let ids: Vec<i32> = cosmetics.iter().map(|cosmetic| cosmetic.id).collect();
+	record_grant(txn, player_id, &ids, metadata).await?;
+	Ok(split_emotes(cosmetics.iter()))
+}
+
+async fn record_grant(
+	txn: &impl ConnectionTrait,
+	player_id: i32,
+	ids: &[i32],
+	metadata: Value,
+) -> Result<(), DbErr> {
+	let transaction = transaction::ActiveModel {
+		player_id: Set(player_id),
+		provider: Set(TransactionProvider::AdminGrant),
+		provider_transaction_id: Set(None),
+		status: Set(TransactionStatus::Completed),
+		raw_metadata: Set(metadata),
+		..Default::default()
+	}
+	.insert(txn)
+	.await?;
+
+	// Owned for good, including over a rental the player already holds.
+	ownership::record(
+		txn,
+		player_id,
+		ids,
+		TransactionProvider::AdminGrant,
+		Some(transaction.id),
+		None,
+		None,
+	)
+	.await?;
+	ownership::settle(txn, player_id, ids).await?;
+
+	record_ownership_events(
+		txn,
+		player_id,
+		ids,
+		OwnershipEventKind::Granted,
+		TransactionProvider::AdminGrant,
+		Some(transaction.id),
+		None,
+		None,
+	)
+	.await
+}
+
 fn check_size(players: &[Uuid], cosmetic_ids: &[i32]) -> Result<(), GrantError> {
 	if players.len() > MAX_PLAYERS || cosmetic_ids.len() > MAX_COSMETICS {
 		return Err(GrantError::TooMany);
@@ -293,7 +316,7 @@ fn split_emotes<'a>(cosmetics: impl Iterator<Item = &'a cosmetic::Model>) -> (Ve
 	)
 }
 
-async fn notify(
+pub(in crate::api) async fn notify(
 	state: &ApiState,
 	player: Uuid,
 	cosmetic_ids: &[i32],
