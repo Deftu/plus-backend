@@ -105,4 +105,4 @@ futures = "0.3.32"
 regex = "1.12.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 webp-animation = { version = "0.10", features = ["static"] }
-plusrenderer = { git = "https://github.com/Polyfrost/plusrenderer", rev = "914ddf8cae388126407d86925a05fa3db085ebbc" }
+plusrenderer = { git = "https://github.com/Polyfrost/plusrenderer", tag = "v1.1.0" }
