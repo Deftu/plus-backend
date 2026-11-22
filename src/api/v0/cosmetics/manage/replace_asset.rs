@@ -12,7 +12,8 @@ use axum::{
 use entities::sea_orm_active_enums::CosmeticType;
 use schemars::JsonSchema;
 use sea_orm::{
-	ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, sea_query::Expr,
+	ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
+	sea_query::Expr,
 };
 use serde::Serialize;
 
@@ -215,21 +216,28 @@ async fn endpoint(
 		Some((cover, preview)) => (Some(cover), preview),
 		None => (cosmetic.cover_asset_id, cosmetic.preview_asset_id),
 	};
+	let shared_asset_id = match cosmetic.r#type {
+		CosmeticType::Nameplate => cosmetic.asset_id,
+		_ => None,
+	};
 	let mut active: cosmetic::ActiveModel = cosmetic.into();
 	active.asset_id = Set(Some(asset.id));
 	active.cover_asset_id = Set(cover_asset_id);
 	active.preview_asset_id = Set(preview_asset_id);
-	let updated = active.update(&state.database).await?;
 
-	if !shared.is_empty() {
+	let txn = state.database.begin().await?;
+	let updated = active.update(&txn).await?;
+	if let Some(old_asset_id) = shared_asset_id {
 		Cosmetic::update_many()
 			.col_expr(cosmetic::Column::AssetId, Expr::value(asset.id))
-			.filter(cosmetic::Column::Id.is_in(shared.iter().map(|row| row.id)))
-			.exec(&state.database)
+			.filter(cosmetic::Column::AssetId.eq(old_asset_id))
+			.filter(cosmetic::Column::Type.eq(CosmeticType::Nameplate))
+			.exec(&txn)
 			.await?;
 	}
+	txn.commit().await?;
 
-	crate::api::v0::cosmetics::notify_catalog_updated(&state).await;
+	crate::api::v0::cosmetics::notify_catalog_updated(&state);
 
 	Ok(Json(ReplaceAssetResponse {
 		cosmetic_id: updated.id,

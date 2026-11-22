@@ -13,7 +13,9 @@ use std::collections::HashMap;
 
 use entities::sea_orm_active_enums::{AssetKind, BodySlot, CosmeticType};
 use schemars::JsonSchema;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+	ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -72,6 +74,12 @@ pub enum UploadError {
 	FileAndAssetFrom,
 	#[error("asset_from must name another nameplate that has an asset")]
 	InvalidAssetFrom,
+	#[error("asset_from must name a nameplate in the same group as the new one")]
+	AssetFromOtherGroup,
+	#[error("Another variant in this group already uses the variant key {0:?}")]
+	DuplicateVariantKey(String),
+	#[error("enabled must be true or false")]
+	InvalidEnabled,
 	#[error("The cover must be a PNG image")]
 	InvalidCover,
 	#[error("Unable to store the cover: {0}")]
@@ -101,8 +109,11 @@ impl IntoResponse for UploadError {
 				| Self::InvalidNameplateSlots
 				| Self::FileAndAssetFrom
 				| Self::InvalidAssetFrom
+				| Self::AssetFromOtherGroup
+				| Self::InvalidEnabled
 				| Self::InvalidCover
 				| Self::Rejection(_) => StatusCode::BAD_REQUEST,
+				Self::DuplicateVariantKey(_) => StatusCode::CONFLICT,
 				Self::PayNow(_) => StatusCode::BAD_GATEWAY,
 				Self::Database(_) | Self::S3(_) | Self::Multipart(_) | Self::Cover(_) => {
 					StatusCode::INTERNAL_SERVER_ERROR
@@ -262,6 +273,7 @@ struct CosmeticUploadRequest {
 	asset_from: Option<i32>,
 	#[schemars(with = "Option<String>")]
 	cover: Option<String>,
+	enabled: Option<bool>,
 }
 
 impl OperationInput for FileUpload {
@@ -316,6 +328,7 @@ async fn endpoint(
 	let mut variant_key = None;
 	let mut asset_from = None;
 	let mut cover_data = None;
+	let mut enabled = true;
 
 	while let Some(field) = multipart.next_field().await? {
 		match field.name() {
@@ -417,6 +430,15 @@ async fn endpoint(
 			Some("cover_seconds") => {
 				cover_seconds = field.text().await?.trim().parse::<f32>().ok();
 			}
+			Some("enabled") => {
+				let value = field.text().await?;
+				match value.trim().to_ascii_lowercase().as_str() {
+					"" => {}
+					"true" | "1" => enabled = true,
+					"false" | "0" => enabled = false,
+					_ => return Err(UploadError::InvalidEnabled),
+				}
+			}
 			_ => {}
 		}
 	}
@@ -439,6 +461,23 @@ async fn endpoint(
 		cosmetic, cosmetic_allowed_slot, cosmetic_group, cosmetic_group_allowed_slot,
 		prelude::*,
 	};
+
+	let existing_group = match &group_name {
+		Some(group_name) => {
+			CosmeticGroup::find()
+				.filter(cosmetic_group::Column::Name.eq(group_name.clone()))
+				.filter(cosmetic_group::Column::Type.eq(cosmetic_type.clone()))
+				.one(&state.database)
+				.await?
+		}
+		None => None,
+	};
+
+	if let (Some(group), Some(key)) = (&existing_group, variant_key.as_deref())
+		&& variant_key_taken(&state.database, group.id, key, None).await?
+	{
+		return Err(UploadError::DuplicateVariantKey(key.to_string()));
+	}
 
 	let (asset, renders) = match (file_data, asset_from) {
 		(Some(_), Some(_)) => return Err(UploadError::FileAndAssetFrom),
@@ -466,6 +505,11 @@ async fn endpoint(
 				.await?
 				.filter(|source| source.r#type == CosmeticType::Nameplate)
 				.ok_or(UploadError::InvalidAssetFrom)?;
+			if source.group_id.is_none()
+				|| source.group_id != existing_group.as_ref().map(|group| group.id)
+			{
+				return Err(UploadError::AssetFromOtherGroup);
+			}
 			let asset = match source.asset_id {
 				Some(asset_id) => {
 					Asset::find_by_id(asset_id).one(&state.database).await?
@@ -487,18 +531,13 @@ async fn endpoint(
 
 	let group = match group_name {
 		Some(group_name) => {
-			let existing = CosmeticGroup::find()
-				.filter(cosmetic_group::Column::Name.eq(group_name.clone()))
-				.filter(cosmetic_group::Column::Type.eq(cosmetic_type.clone()))
-				.one(&state.database)
-				.await?;
-			let group = match existing {
+			let group = match existing_group {
 				Some(group) => group,
 				None => {
 					cosmetic_group::ActiveModel {
 						name: Set(group_name),
 						r#type: Set(cosmetic_type.clone()),
-						enabled: Set(true),
+						enabled: Set(enabled),
 						..Default::default()
 					}
 					.insert(&state.database)
@@ -547,7 +586,7 @@ async fn endpoint(
 		preview_asset_id: Set(renders.and_then(|(_, preview)| preview)),
 		name: Set(Some(resolved_name)),
 		r#type: Set(cosmetic_type),
-		enabled: Set(true),
+		enabled: Set(enabled),
 		group_id: Set(group.as_ref().map(|g| g.id)),
 		variant_name: Set(variant_name),
 		model_variant: Set(model_variant),
@@ -561,6 +600,8 @@ async fn endpoint(
 	}
 	.insert(&state.database)
 	.await?;
+
+	crate::api::v0::cosmetics::notify_catalog_updated(&state);
 
 	// A failure here leaves a priced cosmetic with no product, which
 	// `provision-paynow` picks up on its next run.
@@ -637,7 +678,7 @@ async fn endpoint(
 	)
 	.await?;
 
-	crate::api::v0::cosmetics::notify_catalog_updated(&state).await;
+	crate::api::v0::cosmetics::notify_catalog_updated(&state);
 
 	Ok(Json(infos.remove(0)))
 }
@@ -777,6 +818,23 @@ pub(super) async fn store_renders(
 		None => None,
 	};
 	Ok((cover, preview))
+}
+
+pub(super) async fn variant_key_taken<C: ConnectionTrait>(
+	db: &C,
+	group_id: i32,
+	key: &str,
+	except: Option<i32>,
+) -> Result<bool, sea_orm::DbErr> {
+	use entities::{cosmetic, prelude::*};
+
+	let mut query = Cosmetic::find()
+		.filter(cosmetic::Column::GroupId.eq(group_id))
+		.filter(cosmetic::Column::VariantKey.eq(key));
+	if let Some(id) = except {
+		query = query.filter(cosmetic::Column::Id.ne(id));
+	}
+	Ok(query.one(db).await?.is_some())
 }
 
 fn is_png(data: &[u8]) -> bool {

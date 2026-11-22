@@ -21,6 +21,8 @@ pub enum UpdateVariantError {
 	MissingSlots,
 	#[error("Nameplates take exactly one body slot, `nameplate`")]
 	InvalidNameplateSlots,
+	#[error("Another variant in this group already uses the variant key {0:?}")]
+	DuplicateVariantKey(String),
 	#[error("Database error: {0}")]
 	Database(#[from] sea_orm::error::DbErr),
 	#[error(transparent)]
@@ -46,6 +48,7 @@ impl IntoResponse for UpdateVariantError {
 		crate::api::admin_error_response(
 			match self {
 				Self::MissingCosmetic => StatusCode::NOT_FOUND,
+				Self::DuplicateVariantKey(_) => StatusCode::CONFLICT,
 				Self::MissingSlots | Self::InvalidNameplateSlots | Self::Nameplate(_) => {
 					StatusCode::BAD_REQUEST
 				}
@@ -139,6 +142,14 @@ async fn endpoint(
 		bundle.check_variant_key(Some(variant_key))?;
 	}
 
+	if let Some(Some(variant_key)) = &body.variant_key
+		&& let Some(group_id) = cosmetic.group_id
+		&& super::create::variant_key_taken(&txn, group_id, variant_key, Some(cosmetic.id))
+			.await?
+	{
+		return Err(UpdateVariantError::DuplicateVariantKey(variant_key.clone()));
+	}
+
 	if let Some(slots) = &body.slots {
 		if slots.is_empty() && cosmetic.r#type != CosmeticType::Emote {
 			return Err(UpdateVariantError::MissingSlots);
@@ -203,7 +214,7 @@ async fn endpoint(
 
 	txn.commit().await?;
 
-	crate::api::v0::cosmetics::notify_catalog_updated(&state).await;
+	crate::api::v0::cosmetics::notify_catalog_updated(&state);
 
 	Ok(StatusCode::NO_CONTENT)
 }

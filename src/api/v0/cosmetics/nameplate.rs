@@ -8,6 +8,7 @@ use crate::{api::ApiState, utils::zip::is_zip};
 const MAX_BUNDLE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 128;
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MANIFEST: &str = "manifest.json";
 const DEFAULT_VARIANT: &str = "default";
@@ -25,6 +26,8 @@ pub(crate) enum NameplateBundleError {
 		"The bundle unpacks to {0} bytes, and clients read at most {MAX_UNPACKED_BYTES}"
 	)]
 	TooLargeUnpacked(u64),
+	#[error("{0} unpacks to {1} bytes, and clients read at most {MAX_FILE_BYTES} per file")]
+	FileTooLarge(String, u64),
 	#[error("The bundle has no manifest.json")]
 	MissingManifest,
 	#[error("manifest.json is larger than {MAX_MANIFEST_BYTES} bytes")]
@@ -74,6 +77,12 @@ impl NameplateBundle {
 			unpacked = unpacked.saturating_add(entry.size());
 			if entry.is_dir() {
 				continue;
+			}
+			if entry.size() > MAX_FILE_BYTES {
+				return Err(NameplateBundleError::FileTooLarge(
+					entry.name().to_string(),
+					entry.size(),
+				));
 			}
 			match entry.name().split_once('/') {
 				None if entry.name() == MANIFEST => root_manifest = Some(index),
@@ -143,4 +152,190 @@ pub(crate) async fn stored_bundle(
 	};
 	let data = state.s3_bucket.get_object(path).await?.to_vec();
 	Ok(Some(NameplateBundle::read(&data)?))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::io::{Cursor, Write};
+
+	use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+	use super::{
+		MAX_BUNDLE_BYTES, MAX_ENTRIES, MAX_FILE_BYTES, NameplateBundle, NameplateBundleError,
+	};
+
+	fn zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+		let mut out = Cursor::new(Vec::new());
+		let mut writer = ZipWriter::new(&mut out);
+		let options =
+			SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+		for (name, data) in files {
+			writer.start_file(*name, options).expect("start a test entry");
+			writer.write_all(data).expect("write a test entry");
+		}
+		writer.finish().expect("finish the test zip");
+		out.into_inner()
+	}
+
+	fn read(files: &[(&str, &[u8])]) -> Result<NameplateBundle, NameplateBundleError> {
+		NameplateBundle::read(&zip(files))
+	}
+
+	const PLAIN: &[u8] = br#"{"format":1}"#;
+	const VARIANTS: &[u8] = br#"{"format":1,"variants":{"blue":{},"red":{}}}"#;
+
+	#[test]
+	fn reads_a_plain_bundle() {
+		assert!(read(&[("manifest.json", PLAIN), ("plate.png", b"png")]).is_ok());
+	}
+
+	#[test]
+	fn reads_a_manifest_inside_one_folder() {
+		assert!(read(&[("plate/manifest.json", PLAIN)]).is_ok());
+	}
+
+	#[test]
+	fn rejects_data_that_is_not_a_zip() {
+		assert!(matches!(
+			NameplateBundle::read(b"not a zip"),
+			Err(NameplateBundleError::NotZip)
+		));
+	}
+
+	#[test]
+	fn rejects_an_oversized_zip() {
+		let mut data = b"PK\x03\x04".to_vec();
+		data.resize(MAX_BUNDLE_BYTES + 1, 0);
+		assert!(matches!(
+			NameplateBundle::read(&data),
+			Err(NameplateBundleError::TooLarge(size)) if size == MAX_BUNDLE_BYTES + 1
+		));
+	}
+
+	#[test]
+	fn rejects_too_many_entries() {
+		let names: Vec<String> = (0..MAX_ENTRIES).map(|i| format!("{i}.png")).collect();
+		let mut files: Vec<(&str, &[u8])> =
+			names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+		files.push(("manifest.json", PLAIN));
+		assert!(matches!(
+			read(&files),
+			Err(NameplateBundleError::TooManyEntries(count)) if count == MAX_ENTRIES + 1
+		));
+	}
+
+	#[test]
+	fn accepts_the_entry_limit() {
+		let names: Vec<String> =
+			(0..MAX_ENTRIES - 1).map(|i| format!("{i}.png")).collect();
+		let mut files: Vec<(&str, &[u8])> =
+			names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+		files.push(("manifest.json", PLAIN));
+		assert!(read(&files).is_ok());
+	}
+
+	#[test]
+	fn rejects_a_large_unpacked_size() {
+		let block = vec![0u8; MAX_FILE_BYTES as usize];
+		let names: Vec<String> = (0..9).map(|i| format!("{i}.png")).collect();
+		let mut files: Vec<(&str, &[u8])> =
+			names.iter().map(|name| (name.as_str(), block.as_slice())).collect();
+		files.push(("manifest.json", PLAIN));
+		assert!(matches!(
+			read(&files),
+			Err(NameplateBundleError::TooLargeUnpacked(_))
+		));
+	}
+
+	#[test]
+	fn rejects_a_file_over_the_per_file_cap() {
+		let big = vec![0u8; MAX_FILE_BYTES as usize + 1];
+		assert!(matches!(
+			read(&[("manifest.json", PLAIN), ("plate.png", &big)]),
+			Err(NameplateBundleError::FileTooLarge(name, size))
+				if name == "plate.png" && size == MAX_FILE_BYTES + 1
+		));
+	}
+
+	#[test]
+	fn accepts_a_file_at_the_per_file_cap() {
+		let exact = vec![0u8; MAX_FILE_BYTES as usize];
+		assert!(read(&[("manifest.json", PLAIN), ("plate.png", &exact)]).is_ok());
+	}
+
+	#[test]
+	fn rejects_a_missing_manifest() {
+		assert!(matches!(
+			read(&[("plate.png", b"png")]),
+			Err(NameplateBundleError::MissingManifest)
+		));
+		assert!(matches!(
+			read(&[("a/manifest.json", PLAIN), ("b/manifest.json", PLAIN)]),
+			Err(NameplateBundleError::MissingManifest)
+		));
+	}
+
+	#[test]
+	fn rejects_an_unsupported_format() {
+		assert!(matches!(
+			read(&[("manifest.json", br#"{"format":2}"#)]),
+			Err(NameplateBundleError::UnsupportedFormat(2))
+		));
+	}
+
+	#[test]
+	fn rejects_an_invalid_manifest() {
+		assert!(matches!(
+			read(&[("manifest.json", b"{")]),
+			Err(NameplateBundleError::InvalidManifest(_))
+		));
+		assert!(matches!(
+			read(&[("manifest.json", b"{}")]),
+			Err(NameplateBundleError::InvalidManifest(_))
+		));
+	}
+
+	#[test]
+	fn rejects_an_oversized_manifest() {
+		let mut manifest = br#"{"format":1,"pad":""#.to_vec();
+		manifest.resize(MAX_FILE_BYTES as usize, b'a');
+		manifest.extend_from_slice(b"\"}");
+		assert!(matches!(
+			read(&[("manifest.json", &manifest)]),
+			Err(NameplateBundleError::FileTooLarge(..))
+		));
+	}
+
+	#[test]
+	fn a_bundle_without_variants_only_has_the_default_key() {
+		let bundle = read(&[("manifest.json", PLAIN)]).expect("a valid bundle");
+		assert!(bundle.check_variant_key(None).is_ok());
+		assert!(bundle.check_variant_key(Some("default")).is_ok());
+		assert!(matches!(
+			bundle.check_variant_key(Some("blue")),
+			Err(NameplateBundleError::UnknownVariant(key)) if key == "blue"
+		));
+	}
+
+	#[test]
+	fn empty_variants_count_as_none() {
+		let bundle = read(&[("manifest.json", br#"{"format":1,"variants":{}}"#)]).expect("a valid bundle");
+		assert!(bundle.check_variant_key(Some("default")).is_ok());
+	}
+
+	#[test]
+	fn a_bundle_with_variants_checks_its_keys() {
+		let bundle = read(&[("manifest.json", VARIANTS)]).expect("a valid bundle");
+		assert!(bundle.check_variant_key(None).is_ok());
+		assert!(bundle.check_variant_key(Some("blue")).is_ok());
+		assert!(bundle.check_variant_key(Some("red")).is_ok());
+		assert!(matches!(
+			bundle.check_variant_key(Some("default")),
+			Err(NameplateBundleError::UnknownVariant(_))
+		));
+		assert!(matches!(
+			bundle.check_variant_key(Some("green")),
+			Err(NameplateBundleError::UnknownVariant(_))
+		));
+	}
 }

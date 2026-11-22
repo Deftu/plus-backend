@@ -11,6 +11,7 @@ mod view;
 use std::{
 	collections::{BTreeMap, HashMap},
 	sync::Arc,
+	time::Duration,
 };
 
 use aide::axum::ApiRouter;
@@ -29,7 +30,14 @@ use sea_orm::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::api::ApiState;
+use crate::{
+	api::{
+		ApiState, state::RealtimeState, v0::websocket::structs::ClientBoundPacket,
+	},
+	utils::debounce::Debouncer,
+};
+
+const CATALOG_UPDATE_DELAY: Duration = Duration::from_secs(3);
 
 pub(super) async fn setup_router() -> ApiRouter<ApiState> {
 	ApiRouter::new()
@@ -152,12 +160,21 @@ impl VariantInfo {
 	}
 }
 
-pub(super) async fn notify_catalog_updated(state: &ApiState) {
-	let version = chrono::Utc::now().timestamp_millis();
-	crate::api::v0::websocket::broadcast_all(state, || {
-		crate::api::v0::websocket::structs::ClientBoundPacket::CatalogUpdated { version }
+pub(in crate::api) fn spawn_catalog_notifier(realtime: RealtimeState) -> Debouncer {
+	Debouncer::spawn(CATALOG_UPDATE_DELAY, move || {
+		let realtime = realtime.clone();
+		async move {
+			let version = chrono::Utc::now().timestamp_millis();
+			let connections = realtime.connections.read().await;
+			for connection in connections.values() {
+				let _ = connection.tx.send(ClientBoundPacket::CatalogUpdated { version });
+			}
+		}
 	})
-	.await;
+}
+
+pub(super) fn notify_catalog_updated(state: &ApiState) {
+	state.catalog_updates.trigger();
 }
 
 /// Matches cosmetics that are not hidden by their group
@@ -491,10 +508,54 @@ pub(super) struct PartialEquippedCosmetics {
 
 #[cfg(test)]
 mod tests {
-	use entities::{asset, sea_orm_active_enums::AssetKind};
+	use entities::{
+		asset, cosmetic,
+		sea_orm_active_enums::{AssetKind, CosmeticType},
+	};
 
-	use super::CachedAssetInfo;
+	use super::{CachedAssetInfo, is_redundant_variant};
 	use crate::utils::hash::sha256_hex;
+
+	fn variant(r#type: CosmeticType, variant_name: Option<&str>) -> cosmetic::Model {
+		cosmetic::Model {
+			id: 1,
+			r#type,
+			asset_id: None,
+			name: None,
+			enabled: true,
+			created_at: Default::default(),
+			updated_at: Default::default(),
+			group_id: Some(1),
+			variant_name: variant_name.map(str::to_owned),
+			model_variant: None,
+			variant_order: 0,
+			store_product_id: None,
+			base_price: None,
+			collection: None,
+			description: None,
+			purchase_count: 0,
+			cover_asset_id: None,
+			preview_asset_id: None,
+			variant_key: None,
+		}
+	}
+
+	#[test]
+	fn reversed_and_folded_variants_are_redundant() {
+		assert!(is_redundant_variant(&variant(CosmeticType::Cape, Some("Reversed"))));
+		assert!(is_redundant_variant(&variant(CosmeticType::Cape, Some("Folded"))));
+		assert!(!is_redundant_variant(&variant(CosmeticType::Cape, Some("Blue"))));
+		assert!(!is_redundant_variant(&variant(CosmeticType::Cape, None)));
+	}
+
+	#[test]
+	fn nameplate_variants_are_never_redundant() {
+		assert!(!is_redundant_variant(&variant(
+			CosmeticType::Nameplate,
+			Some("Reversed")
+		)));
+		assert!(!is_redundant_variant(&variant(CosmeticType::Nameplate, Some("Fold"))));
+	}
 
 	#[test]
 	fn default_hash_is_sha256_of_null() {
