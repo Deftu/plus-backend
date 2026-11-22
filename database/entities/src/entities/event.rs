@@ -14,6 +14,8 @@ pub struct Model {
 	#[sea_orm(column_type = "JsonBinary")]
 	pub config: Json,
 	pub created_at: DateTimeWithTimeZone,
+	#[sea_orm(column_type = "Text", nullable, unique)]
+	pub slug: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
