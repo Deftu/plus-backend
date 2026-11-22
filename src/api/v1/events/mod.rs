@@ -59,6 +59,8 @@ pub enum EventError {
 	Expired,
 	#[error("That reward was already claimed")]
 	AlreadyClaimed,
+	#[error("Another event already uses that slug")]
+	SlugTaken,
 	#[error("That reward's requirements are not met yet")]
 	RequirementsNotMet,
 	#[error("Events can only be used in-game")]
@@ -83,7 +85,7 @@ impl IntoResponse for EventError {
 				StatusCode::BAD_REQUEST
 			}
 			Self::Expired => StatusCode::GONE,
-			Self::AlreadyClaimed => StatusCode::CONFLICT,
+			Self::AlreadyClaimed | Self::SlugTaken => StatusCode::CONFLICT,
 			Self::NotInGame => StatusCode::FORBIDDEN,
 			Self::Malformed(_) | Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
 		};
@@ -94,6 +96,8 @@ impl IntoResponse for EventError {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EventBody {
 	name: String,
+	#[serde(default)]
+	slug: Option<String>,
 	#[serde(flatten)]
 	config: EventKind,
 }
@@ -102,6 +106,7 @@ struct EventBody {
 struct EventView {
 	id: i32,
 	name: String,
+	slug: Option<String>,
 	/// When the first reward opens.
 	starts_at: DateTimeWithTimeZone,
 	/// When the last reward closes.
@@ -138,6 +143,7 @@ struct SlotView {
 struct PlayerEventView {
 	id: i32,
 	name: String,
+	slug: Option<String>,
 	starts_at: DateTimeWithTimeZone,
 	ends_at: DateTimeWithTimeZone,
 	slots: Vec<SlotView>,
@@ -182,7 +188,9 @@ fn create_doc(op: TransformOperation) -> TransformOperation {
 			 into rewards a player can claim once while they are open, and the \
 			 event runs from the first opening to the last closing. A \
 			 `daily_rewards` event opens one reward per UTC day for \
-			 `claim_window_hours`. Requires `MANAGE_EVENTS`.",
+			 `claim_window_hours`. An optional `slug` of lowercase letters, \
+			 digits and hyphens gives the event a unique handle clients can \
+			 recognise it by. Requires `MANAGE_EVENTS`.",
 		)
 		.tag("events")
 }
@@ -191,9 +199,9 @@ fn update_doc(op: TransformOperation) -> TransformOperation {
 	op.id("updateEvent")
 		.summary("Replace an event")
 		.description(
-			"Replaces an event's name and settings. Claims are kept against \
-			 their slot, so a slot already claimed stays claimed. Requires \
-			 `MANAGE_EVENTS`.",
+			"Replaces an event's name, `slug` and settings. Leaving `slug` out \
+			 clears it. Claims are kept against their slot, so a slot already \
+			 claimed stays claimed. Requires `MANAGE_EVENTS`.",
 		)
 		.tag("events")
 }
@@ -262,7 +270,8 @@ async fn create(
 	let event = checked_row(&state.database, &body, ActiveValue::NotSet)
 		.await?
 		.insert(&state.database)
-		.await?;
+		.await
+		.map_err(slug_conflict)?;
 
 	Ok(Json(view(event)?))
 }
@@ -279,7 +288,7 @@ async fn update(
 		.await
 		.map_err(|error| match error {
 			DbErr::RecordNotUpdated => EventError::NotFound,
-			error => error.into(),
+			error => slug_conflict(error),
 		})?;
 
 	Ok(Json(view(event)?))
@@ -374,6 +383,7 @@ async fn active(
 		views.push(PlayerEventView {
 			id: event.id,
 			name: event.name,
+			slug: event.slug,
 			starts_at: event.starts_at,
 			ends_at: event.ends_at,
 			slots,
@@ -443,10 +453,37 @@ fn view(event: event::Model) -> Result<EventView, EventError> {
 	Ok(EventView {
 		id: event.id,
 		name: event.name,
+		slug: event.slug,
 		starts_at: event.starts_at,
 		ends_at: event.ends_at,
 		config: from_value(event.config)?,
 	})
+}
+
+fn slug_conflict(error: DbErr) -> EventError {
+	match error.sql_err() {
+		Some(SqlErr::UniqueConstraintViolation(_)) => EventError::SlugTaken,
+		_ => error.into(),
+	}
+}
+
+fn slug(slug: Option<&str>) -> Result<Option<String>, EventError> {
+	let Some(slug) = slug.map(str::trim).filter(|slug| !slug.is_empty()) else {
+		return Ok(None);
+	};
+	let mut chars = slug.chars();
+	let starts_well = chars
+		.next()
+		.is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit());
+	let rest_ok = chars
+		.all(|char| char.is_ascii_lowercase() || char.is_ascii_digit() || char == '-');
+	if !starts_well || !rest_ok || slug.len() > 48 {
+		return Err(EventError::Invalid(
+			"Slug must be 1 to 48 lowercase letters, digits or hyphens, starting with a letter or digit",
+		));
+	}
+
+	Ok(Some(slug.to_owned()))
 }
 
 fn status(
@@ -475,6 +512,7 @@ async fn checked_row(
 	if body.name.trim().is_empty() {
 		return Err(EventError::Invalid("Name must not be empty"));
 	}
+	let slug = slug(body.slug.as_deref())?;
 
 	let slots = body.config.slots();
 	let mut keys = HashSet::new();
@@ -501,6 +539,7 @@ async fn checked_row(
 	Ok(event::ActiveModel {
 		id,
 		name: Set(body.name.trim().to_owned()),
+		slug: Set(slug),
 		starts_at: Set(starts_at),
 		ends_at: Set(ends_at),
 		config: Set(to_value(&body.config)?),
@@ -513,7 +552,7 @@ mod tests {
 	use chrono::Duration;
 	use serde_json::{from_value, json};
 
-	use super::{SlotStatus, kinds::EventKind, status};
+	use super::{EventError, SlotStatus, kinds::EventKind, slug, status};
 
 	#[test]
 	fn a_daily_reward_stays_claimable_for_its_window() {
@@ -534,5 +573,40 @@ mod tests {
 		assert_eq!(check(71, false), SlotStatus::Claimable, "late on the 3rd");
 		assert_eq!(check(72, false), SlotStatus::Missed);
 		assert_eq!(check(80, true), SlotStatus::Claimed);
+	}
+
+	#[test]
+	fn a_blank_slug_is_no_slug() {
+		assert_eq!(slug(None).unwrap(), None);
+		assert_eq!(slug(Some("")).unwrap(), None);
+		assert_eq!(slug(Some("  \t ")).unwrap(), None);
+		assert_eq!(
+			slug(Some(" advent-2026 ")).unwrap().as_deref(),
+			Some("advent-2026")
+		);
+	}
+
+	#[test]
+	fn a_slug_is_lowercase_letters_digits_and_hyphens() {
+		let longest = "a".repeat(48);
+		for valid in ["advent-2026", "2026", "a", "valentines-", longest.as_str()] {
+			assert_eq!(slug(Some(valid)).unwrap().as_deref(), Some(valid));
+		}
+
+		let too_long = "a".repeat(49);
+		for invalid in [
+			"Advent-2026",
+			"-advent",
+			"advent_2026",
+			"advent 2026",
+			"advent.2026",
+			"noël",
+			too_long.as_str(),
+		] {
+			assert!(
+				matches!(slug(Some(invalid)), Err(EventError::Invalid(_))),
+				"{invalid:?} should be rejected"
+			);
+		}
 	}
 }
